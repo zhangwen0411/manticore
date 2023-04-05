@@ -253,7 +253,7 @@ class WASMWorld(Platform):
             else:
                 if isinstance(i.desc, TypeIdx):  # Imported function
                     func_type = module.types[i.desc]
-                    if i.module == "env" and imported_version:
+                    if imported_version:
                         if callable(imported_version):
                             logger.info(
                                 "Auto-converting callable %s into HostFunc of appropriate type",

@@ -76,7 +76,7 @@ setup(
         "rlp",
         "intervaltree",
         "crytic-compile>=0.2.2",
-        "wasm",
+        "wasm @ git+https://github.com/zhangwen0411/wasm@memext",
         "dataclasses; python_version < '3.7'",
         "pyevmasm>=0.2.3",
     ]
