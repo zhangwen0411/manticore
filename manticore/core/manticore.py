@@ -25,7 +25,9 @@ from ..utils.event import Eventful
 from ..utils.helpers import PickleSerializer, pretty_print_state_descriptors, deque
 from ..utils.log import set_verbosity
 from ..utils.nointerrupt import WithKeyboardInterruptAs
+from .abstract_workspace import AbstractWorkspace
 from .workspace import Workspace, Testcase
+from .non_serializing_workspace import NonSerializingWorkspace
 from .worker import (
     WorkerSingle,
     WorkerThread,
@@ -360,13 +362,22 @@ class ManticoreBase(Eventful):
         else:
             if workspace_url is not None:
                 raise TypeError(f"Invalid workspace type: {type(workspace_url).__name__}")
-        self._workspace = Workspace(workspace_url)
-        # reuse the same workspace if not specified
-        if outputspace_url is None:
-            outputspace_url = workspace_url
-        if outputspace_url is None:
-            outputspace_url = f"fs:{self._workspace.uri}"
-        self._output = ManticoreOutput(outputspace_url)
+
+        self._workspace: AbstractWorkspace
+        self._output: ManticoreOutput
+        if workspace_url == "non_serializing:":
+            assert consts.mprocessing == MProcessingType.single,\
+                f"Non-serializing workspace can be used only with single-threaded, not {consts.mprocessing}"
+            self._workspace = NonSerializingWorkspace()
+            self._output = ManticoreOutput("mem:")
+        else:
+            self._workspace = Workspace(workspace_url)
+            # reuse the same workspace if not specified
+            if outputspace_url is None:
+                outputspace_url = workspace_url
+            if outputspace_url is None:
+                outputspace_url = f"fs:{self._workspace.uri}"
+            self._output = ManticoreOutput(outputspace_url)
 
         # The set of registered plugins
         # The callback methods defined in the plugin object will be called when
@@ -408,37 +419,40 @@ class ManticoreBase(Eventful):
         """Copy/Duplicate/backup all ready states and save it in a snapshot.
         If there is a snapshot already saved it will be overrwritten
         """
-        if self._snapshot is not None:
-            logger.info("Overwriting a snapshot of the ready states")
-        snapshot = []
-        for state_id in self._ready_states:
-            state = self._load(state_id)
-            # Re-save the state in case the user changed its data
-            snapshot.append(self._save(state))
-        self._snapshot = snapshot
+        raise NotImplementedError
+        # if self._snapshot is not None:
+        #     logger.info("Overwriting a snapshot of the ready states")
+        # snapshot = []
+        # for state_id in self._ready_states:
+        #     state = self._load(state_id)
+        #     # Re-save the state in case the user changed its data
+        #     snapshot.append(self._save(state))
+        # self._snapshot = snapshot
 
     @sync
     @only_from_main_script
     def goto_snapshot(self):
         """REMOVE current ready states and replace them with the saved states
         in a snapshot"""
-        if not self._snapshot:
-            raise ManticoreError("No snapshot to go to")
-        self.clear_ready_states()
-        for state_id in self._snapshot:
-            self._publish("will_enqueue_state", None, can_raise=False)
-            self._ready_states.append(state_id)
-            self._publish("did_enqueue_state", state_id, can_raise=False)
-        self._snapshot = None
+        raise NotImplementedError
+        # if not self._snapshot:
+        #     raise ManticoreError("No snapshot to go to")
+        # self.clear_ready_states()
+        # for state_id in self._snapshot:
+        #     self._publish("will_enqueue_state", None, can_raise=False)
+        #     self._ready_states.append(state_id)
+        #     self._publish("did_enqueue_state", state_id, can_raise=False)
+        # self._snapshot = None
 
     @sync
     @only_from_main_script
     def clear_snapshot(self):
         """Remove any saved states"""
-        if self._snapshot:
-            for state_id in self._snapshot:
-                self._remove(state_id)
-        self._snapshot = None
+        raise NotImplementedError
+        # if self._snapshot:
+        #     for state_id in self._snapshot:
+        #         self._remove(state_id)
+        # self._snapshot = None
 
     @sync
     @at_not_running

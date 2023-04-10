@@ -7,6 +7,8 @@ import io
 
 from contextlib import contextmanager
 
+from .abstract_workspace import AbstractWorkspace
+
 try:
     # nullcontext is not present before Python 3.7
     from contextlib import nullcontext  # type: ignore
@@ -413,7 +415,7 @@ class RedisStore(Store):
         return self._client.keys(glob_str)
 
 
-class Workspace:
+class Workspace(AbstractWorkspace):
     """
     A workspace maintains a list of states to run and assigns them IDs.
     """

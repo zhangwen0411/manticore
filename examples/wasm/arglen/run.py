@@ -1,10 +1,17 @@
-import tempfile
+from functools import partial
+import sys
+from typing import List, Union
 
+from manticore.utils import config
+from manticore.utils.enums import MProcessingType
 from manticore.wasm import ManticoreWASM
 
 FILENAME = "arglen.wasm"
 ARGS = [FILENAME, "hello world!!"]
 
+FDSTAT = bytes((0x2, 0, 0, 0, 0, 0, 0, 0, 0xdb, 0x1, 0xe0, 0x8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,))
+
+STDOUT: List[bytes] = []
 EXIT_VALUE = None
 
 
@@ -32,13 +39,62 @@ def proc_exit(_state, result):
     return []
 
 
-def main():
-    env = dict(args_sizes_get=args_sizes_get, args_get=args_get, proc_exit=proc_exit)
-    with tempfile.TemporaryDirectory() as d:
-        m = ManticoreWASM(FILENAME, sup_env={"wasi_snapshot_preview1": env}, stub_missing=False, workspace_url=d)
-        m._start()
+def fd_fdstat_get(state, fd, out_ptr):
+    assert 0 <= fd <= 2, f"Unsupported fd: {fd}"
+    state.mem.write_bytes(out_ptr, FDSTAT)
+    return [0]
 
-    assert EXIT_VALUE == len(ARGS[1])
+
+def _to_bytes(bss: List[Union[int, bytes]]) -> bytes:
+    lb = []
+    for bs in bss:
+        if isinstance(bs, bytes):
+            lb.append(bs)
+        elif isinstance(bs, int):
+            lb.append(bs.to_bytes(1, byteorder='big'))
+        else:
+            raise ValueError(f"illegal list element: {bs}")
+    return b''.join(lb)
+
+
+def fd_write(state, fd, iovs, iovs_len, out_ptr):
+    assert 1 <= fd <= 2, f"Unsupported fd: {fd}"
+    nb_written = 0
+    for i in range(iovs_len):
+        buf_ptr = state.mem.read_int(iovs)
+        iovs += 4
+        buf_len = state.mem.read_int(iovs)
+        iovs += 4
+
+        buf_bytes = _to_bytes(state.mem.read_bytes(buf_ptr, buf_len))
+        STDOUT.append(buf_bytes)
+        sys.stdout.buffer.write(buf_bytes)
+        nb_written += len(buf_bytes)
+
+    state.mem.write_int(out_ptr, nb_written)
+    return [0]
+
+
+def mock(name, _state, *args):
+    print(f"{name}({args})")
+    raise NotImplementedError
+
+
+def main():
+    core_group = config.get_group("core")
+    core_group.mprocessing = MProcessingType.single
+    core_group.compress_states = False
+
+    env = dict(args_sizes_get=args_sizes_get, args_get=args_get, proc_exit=proc_exit,
+               fd_close=partial(mock, "fd_close"),
+               fd_fdstat_get=fd_fdstat_get,
+               fd_seek=partial(mock, "fd_seek"), fd_write=fd_write)
+    m = ManticoreWASM(FILENAME, sup_env={"wasi_snapshot_preview1": env}, stub_missing=False,
+                      workspace_url="non_serializing:")
+    m._start()
+
+    assert b''.join(STDOUT).decode("ascii") == str(len(ARGS[1])) + "\n"
+    assert EXIT_VALUE is None or EXIT_VALUE == 0, f"abnormal exit: {EXIT_VALUE}"
 
 
 if __name__ == '__main__':
