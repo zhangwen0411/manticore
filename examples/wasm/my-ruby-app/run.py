@@ -1,6 +1,5 @@
 from functools import partial
 import sys
-from tempfile import TemporaryDirectory
 from typing import List, Union
 
 import manticore
@@ -169,7 +168,7 @@ def main():
     # wasi_env = WasiEnvironment(["my-ruby-app.wasm", "/src/my_app.rb"])
     env_dict = wasi_env.get_env_dict()
     # with TemporaryDirectory() as d:
-    m = ManticoreWASM("my-ruby-app.wasm", sup_env={"wasi_snapshot_preview1": env_dict}, stub_missing=False, workspace_url="mem:")
+    m = ManticoreWASM("my-ruby-app.wasm", sup_env={"wasi_snapshot_preview1": env_dict}, stub_missing=False, workspace_url="non_serializing:")
     m._start()
     print(f"Exit result: {wasi_env.get_exit_result()}")
 
