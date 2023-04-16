@@ -1,6 +1,6 @@
 from functools import partial
 import sys
-from typing import List, Sequence, Union
+from typing import List, Sequence, Union, Optional
 
 
 def _to_bytes(bss: List[Union[int, bytes]]) -> bytes:
@@ -19,7 +19,7 @@ class WasiEnvironment:
     """
     Simple WASI environment.
 
-    FIXME(zhangwen): not thread-safe!
+    FIXME(zhangwen): not thread-safe!  and assumes is only used by a single execution.
     """
     ALL_FUNCTION_NAMES = (
         "args_get",
@@ -68,6 +68,7 @@ class WasiEnvironment:
     def __init__(self, args: Sequence[str]) -> None:
         self.args = args
         self.exit_result = None
+        self.stdout: List[bytes] = []
 
         env = {func_name: partial(self.func_missing, func_name) for func_name in self.ALL_FUNCTION_NAMES}  # Default.
         for attr_name in dir(self):
@@ -79,8 +80,11 @@ class WasiEnvironment:
     def get_env_dict(self):
         return self.env
 
-    def get_exit_result(self):
+    def get_exit_result(self) -> Optional[int]:
         return self.exit_result
+
+    def get_stdout(self) -> bytes:
+        return b''.join(self.stdout)
 
     @staticmethod
     def func_missing(func_name, _state, *args):
@@ -141,8 +145,7 @@ class WasiEnvironment:
         state.mem.write_bytes(buf_ptr, b'\0' * buf_len)
         return [0]
 
-    @staticmethod
-    def _wasi_fd_write(state, fd, iovs, iovs_len, out_ptr):
+    def _wasi_fd_write(self, state, fd, iovs, iovs_len, out_ptr):
         assert 1 <= fd <= 2, f"Unsupported fd: {fd}"
         nb_written = 0
         for i in range(iovs_len):
@@ -153,6 +156,7 @@ class WasiEnvironment:
 
             buf_bytes = _to_bytes(state.mem.read_bytes(buf_ptr, buf_len))
             nb_written += sys.stdout.buffer.write(buf_bytes)
+            self.stdout.append(buf_bytes)
 
         state.mem.write_int(out_ptr, nb_written)
         return [0]
