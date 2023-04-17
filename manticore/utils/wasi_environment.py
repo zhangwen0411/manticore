@@ -20,6 +20,7 @@ class WasiEnvironment:
     Simple WASI environment.
 
     FIXME(zhangwen): not thread-safe!  and assumes is only used by a single execution.
+    FIXME(zhangwen): this really should be part of Manticore's WASM state.
     """
     ALL_FUNCTION_NAMES = (
         "args_get",
@@ -65,9 +66,10 @@ class WasiEnvironment:
     STD_FDSTAT = bytes((0x2, 0, 0, 0, 0, 0, 0, 0, 0xdb, 0x1, 0xe0, 0x8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,))
     STD_FILESTAT = bytes((0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
 
-    def __init__(self, args: Sequence[str]) -> None:
+    def __init__(self, args: Sequence[str], stdin: bytes = None) -> None:
         self.args = args
         self.exit_result = None
+        self.stdin: bytes = stdin or b''
         self.stdout: List[bytes] = []
 
         env = {func_name: partial(self.func_missing, func_name) for func_name in self.ALL_FUNCTION_NAMES}  # Default.
@@ -121,6 +123,7 @@ class WasiEnvironment:
 
     @staticmethod
     def _wasi_fd_prestat_get(_state, _fd, _out_ptr):
+        # FIXME(zhangwen): what if 0 <= fd <= 2?
         return [8]  # badf
 
     def _wasi_proc_exit(self, _state, result):
@@ -143,6 +146,22 @@ class WasiEnvironment:
     @staticmethod
     def _wasi_random_get(state, buf_ptr, buf_len):
         state.mem.write_bytes(buf_ptr, b'\0' * buf_len)
+        return [0]
+
+    def _wasi_fd_read(self, state, fd, iovs, iovs_len, out_ptr):
+        assert fd == 0, f"Unsupported fd: {fd}"
+        assert iovs_len == 1, f"Unsupported: iovs_len = {iovs_len} != 1"
+
+        buf_ptr = state.mem.read_int(iovs)
+        iovs += 4
+        buf_len = state.mem.read_int(iovs)
+        iovs += 4
+
+        nb_read = min(len(self.stdin), buf_len)
+        state.mem.write_bytes(buf_ptr, self.stdin[:nb_read])
+        self.stdin = self.stdin[nb_read:]
+
+        state.mem.write_int(out_ptr, nb_read)
         return [0]
 
     def _wasi_fd_write(self, state, fd, iovs, iovs_len, out_ptr):
