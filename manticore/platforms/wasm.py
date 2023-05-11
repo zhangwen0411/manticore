@@ -14,6 +14,8 @@ from ..wasm.structure import (
     TableAddr,
     ExternVal,
     Module,
+    WASIEnvironmentConfig,
+    WASIEnvironment,
 )
 from ..wasm.types import Trap, TypeIdx, TableType, MemoryType, GlobalType, MissingExportException
 from ..core.state import TerminateState
@@ -33,10 +35,24 @@ def stub(arity, _state, *args):
     return [0 for _ in range(arity)]  # TODO: Return symbolic values
 
 
+class WASIModule(typing.Mapping[str, typing.Callable]):
+    def __init__(self, world: "WASMWorld") -> None:
+        self.world = world
+
+    def __getitem__(self, k: str) -> typing.Callable:
+        return self.world.wasi_env.functions[k]
+
+    def __len__(self) -> int:
+        return len(WASIEnvironment.ALL_FUNCTION_NAMES)
+
+    def __iter__(self) -> typing.Iterator[str]:
+        raise NotImplementedError
+
+
 class WASMWorld(Platform):
     """Manages global environment for a WASM state. Analagous to EVMWorld."""
 
-    def __init__(self, filename, name="self", **kwargs):
+    def __init__(self, filename, wasi_config: WASIEnvironmentConfig, name="self", **kwargs):
         """
         :param filename: The WASM module to execute
         :param kwargs: Accepts "constraints" to pass in an initial ConstraintSet
@@ -48,10 +64,11 @@ class WASMWorld(Platform):
         self.instantiated = []
         #: Backing store for functions, memories, tables, and globals
         self.store = Store()
+        self.wasi_env = WASIEnvironment(filename, wasi_config)
 
         self.modules = []
         self.module_names = {}
-        self.manual_exports = {}
+        self.manual_exports = {"wasi_snapshot_preview1": WASIModule(self)}
         self.default_module = name
         self.register_module(name, filename)
 
@@ -69,6 +86,7 @@ class WASMWorld(Platform):
         state = super().__getstate__()
         state["modules"] = self.modules
         state["store"] = self.store
+        state["wasi_env"] = self.wasi_env
         state["stack"] = self.stack
         state["advice"] = self.advice
         state["constraints"] = self.constraints
@@ -81,6 +99,7 @@ class WASMWorld(Platform):
     def __setstate__(self, state):
         self.modules = state["modules"]
         self.store = state["store"]
+        self.wasi_env = state["wasi_env"]
         self.stack = state["stack"]
         self.advice = state["advice"]
         self.constraints = state["constraints"]

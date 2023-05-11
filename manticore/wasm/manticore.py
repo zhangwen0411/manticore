@@ -7,7 +7,7 @@ from .state import State
 from ..core.manticore import ManticoreBase
 from ..core.smtlib import ConstraintSet, issymbolic, SelectedSolver
 from .types import I32, I64, F32, F64
-from .structure import FuncInst
+from .structure import FuncInst, WASIEnvironmentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ class ManticoreWASM(ManticoreBase):
     """
 
     def __init__(
-        self, path_or_state, env={}, sup_env={}, workspace_url=None, policy="random", **kwargs
+        self, path_or_state, env={}, sup_env={}, wasi_config=WASIEnvironmentConfig(), workspace_url=None, policy="random", **kwargs
     ):
         """
         :param path_or_state: Path to binary or a state (object) to begin from.
@@ -28,7 +28,7 @@ class ManticoreWASM(ManticoreBase):
         if isinstance(path_or_state, str):
             if not os.path.isfile(path_or_state):
                 raise OSError(f"{path_or_state} is not an existing regular file")
-            initial_state = _make_initial_state(path_or_state, env, sup_env, **kwargs)
+            initial_state = _make_initial_state(path_or_state, env, sup_env, wasi_config, **kwargs)
         else:
             initial_state = path_or_state
 
@@ -195,7 +195,7 @@ class ManticoreWASM(ManticoreBase):
                 summary.write(f"{str(term)}\n\n")
 
 
-def _make_initial_state(binary_path, env={}, sup_env={}, **kwargs) -> State:
+def _make_initial_state(binary_path, env, sup_env, wasi_config: WASIEnvironmentConfig, **kwargs) -> State:
     """
     Wraps _make_wasm_bin
 
@@ -206,11 +206,11 @@ def _make_initial_state(binary_path, env={}, sup_env={}, **kwargs) -> State:
     :return: initial state
     """
     if binary_path.endswith(".wasm"):
-        return _make_wasm_bin(binary_path, env=env, sup_env=sup_env, **kwargs)
+        return _make_wasm_bin(binary_path, env=env, sup_env=sup_env, wasi_config=wasi_config, **kwargs)
     raise RuntimeError("ManticoreWASM only supports .wasm files at the moment")
 
 
-def _make_wasm_bin(program, env={}, sup_env={}, **kwargs) -> State:
+def _make_wasm_bin(program, env, sup_env, wasi_config: WASIEnvironmentConfig, **kwargs) -> State:
     """
     Returns an initial state for a binary WASM module
 
@@ -224,7 +224,7 @@ def _make_wasm_bin(program, env={}, sup_env={}, **kwargs) -> State:
     logger.info("Loading program %s", program)
 
     constraints = kwargs.get("constraints", ConstraintSet())
-    platform = wasm.WASMWorld(program, constraints=constraints)
+    platform = wasm.WASMWorld(program, constraints=constraints, wasi_config=wasi_config)
     platform.instantiate(
         env,
         sup_env,
