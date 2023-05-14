@@ -36,7 +36,7 @@ class TestReadHex(unittest.TestCase):
 
         exit_values = plugin.results
         self.assertEqual(len(exit_values), 1)
-        exit_value = exit_values[0]
+        exit_value = next(iter(exit_values))
         if exit_value is None:
             self.assertEqual(expected_exit_value, 0)
         else:
