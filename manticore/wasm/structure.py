@@ -1,4 +1,5 @@
 # from __future__ import annotations
+import time
 import typing
 import types
 import logging
@@ -1266,7 +1267,7 @@ class ModuleInstance(Eventful):
             if self._instruction_queue:
                 try:
                     inst = self._instruction_queue.popleft()
-                    logger.info(
+                    logger.debug(
                         "%s: %s (%s)",
                         hex(inst.opcode),
                         inst.mnemonic,
@@ -1989,6 +1990,17 @@ class WASIEnvironmentConfig:
     stdin: typing.Union[bytes, typing.Callable] = None
 
 
+@dataclass(frozen=True)
+class WASILoggingDecorator:
+    name: str
+    func: typing.Callable
+
+    def __call__(self, _state, *args):
+        # logger.warning(f"{self.name}({', '.join(map(str, args))})")
+        print(f"{self.name}({', '.join(map(str, args))})")
+        return self.func(_state, *args)
+
+
 class WASIEnvironment:
     """Models the machine environment (exposed through the WASI interface)."""
     ALL_FUNCTION_NAMES = (
@@ -2063,7 +2075,8 @@ class WASIEnvironment:
         for attr_name in dir(self):
             if attr_name.startswith("_wasi_"):
                 func_name = attr_name[len("_wasi_"):]
-                functions[func_name] = getattr(self, attr_name)
+                func = getattr(self, attr_name)
+                functions[func_name] = WASILoggingDecorator(func_name, func)
         self.functions = functions
 
     def get_exit_result(self) -> int:
@@ -2088,8 +2101,22 @@ class WASIEnvironment:
         return ret
 
     @staticmethod
-    def _wasi_clock_time_get(state, _id, _precision, result_ptr):
-        state.mem.write_int(result_ptr, 0, size=64)
+    def _wasi_clock_time_get(state, wasi_clock_id, _precision, result_ptr):
+        unix_clock_id: int
+        if wasi_clock_id == 0:
+            unix_clock_id = time.CLOCK_REALTIME
+        elif wasi_clock_id == 1:
+            unix_clock_id = time.CLOCK_MONOTONIC
+        elif wasi_clock_id == 2:
+            unix_clock_id = time.CLOCK_PROCESS_CPUTIME_ID
+        elif wasi_clock_id == 3:
+            unix_clock_id = time.CLOCK_THREAD_CPUTIME_ID
+        else:
+            return [28]  # EINVAL
+
+        time_ns = time.clock_gettime_ns(unix_clock_id)
+        time_ns = min(time_ns, 2**64 - 1)
+        state.mem.write_int(result_ptr, time_ns, size=64)
         return [0]
 
     @staticmethod
@@ -2115,7 +2142,6 @@ class WASIEnvironment:
 
     @staticmethod
     def _wasi_fd_prestat_get(_state, _fd, _out_ptr):
-        # FIXME(zhangwen): what if 0 <= fd <= 2?
         return [8]  # badf
 
     def _wasi_proc_exit(self, _state, result):
