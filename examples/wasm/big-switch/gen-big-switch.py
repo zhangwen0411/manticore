@@ -4,7 +4,7 @@ N = 1000
 print("""
 int main(int argc, char **argv) {
 \tint sum = 0;
-\tfor (int i = 0; i < 10; ++i) {
+\tfor (int i = 0; i < 100; ++i) {
 \t\tswitch (argc) {""")
 
 for i in range(N):

@@ -30,7 +30,7 @@ def main():
 
     results = plugin.results
     assert len(results) == 1
-    assert next(iter(results)) == 95
+    assert next(iter(results)) == 50
 
 
 if __name__ == "__main__":
