@@ -757,7 +757,7 @@ class ModuleInstance(Eventful):
         "executor",
         "function_names",
         "local_names",
-        "_instruction_queue",
+        "_instruction_stack",
         "_block_depths",
         "_advice",
         "_state",
@@ -785,8 +785,9 @@ class ModuleInstance(Eventful):
     function_names: typing.Dict[FuncAddr, str]
     #: Stores names of local variables, if available
     local_names: typing.Dict[FuncAddr, typing.Dict[int, str]]
-    #: Stores the unpacked sequence of instructions in the order they should be executed
-    _instruction_queue: typing.Deque[Instruction]
+    #: Stores the unpacked sequence of instructions in the reverse order they should be executed
+    # (i.e., next instruction is at the top of the stack, end of the list).
+    _instruction_stack: typing.List[Instruction]
     #: Keeps track of the current call depth, both for functions and for code blocks. Each function call is represented
     # by appending another 0 to the list, and each code block is represented by incrementing the digit at the end of the
     # list. This is necessary because we unroll the WASM S-Expressions (nested execution trees) into a single
@@ -811,7 +812,7 @@ class ModuleInstance(Eventful):
         self.executor = Executor()
         self.function_names = {}
         self.local_names = {}
-        self._instruction_queue = deque()
+        self._instruction_stack = []
         self._block_depths = [0]
         self._advice = None
         self._state = None
@@ -832,7 +833,7 @@ class ModuleInstance(Eventful):
                 "executor": self.executor,
                 "function_names": self.function_names,
                 "local_names": self.local_names,
-                "_instruction_queue": self._instruction_queue,
+                "_instruction_stack": self._instruction_stack,
                 "_block_depths": self._block_depths,
             }
         )
@@ -849,7 +850,7 @@ class ModuleInstance(Eventful):
         self.executor = state["executor"]
         self.function_names = state["function_names"]
         self.local_names = state["local_names"]
-        self._instruction_queue = state["_instruction_queue"]
+        self._instruction_stack = state["_instruction_stack"]
         self._block_depths = state["_block_depths"]
         self._advice = None
         self._state = None
@@ -859,7 +860,7 @@ class ModuleInstance(Eventful):
         """
         Empties the instruction queue and clears the block depths
         """
-        self._instruction_queue.clear()
+        self._instruction_stack.clear()
         self._block_depths = [0]
 
     def instantiate(
@@ -1209,8 +1210,23 @@ class ModuleInstance(Eventful):
         Pushes instructions into the instruction queue.
         :param insts: Instructions to push
         """
-        for i in insts[::-1]:
-            self._instruction_queue.appendleft(i)
+        self._instruction_stack.extend(reversed(insts))
+
+    def look_forward_from_inst(self, i: Instruction, *opcodes) -> typing.List[Instruction]:
+        if 0x02 <= i.opcode <= 0x04 and opcodes == (0x0B,):  # Looking for the next `end` from a ctrl-flow inst.
+            if (num_instrs_to_pop := i.num_instrs_till_end) is not None:
+                # We have precomputed how many instructions to pop.
+                total = len(self._instruction_stack)
+                instrs = self._instruction_stack[:-(num_instrs_to_pop + 1):-1]  # Last `num_instr_to_pop` insts, reversed.
+                assert len(instrs) == num_instrs_to_pop  # Make sure exactly `num_instrs_to_pop` instrs came out.
+                del self._instruction_stack[-num_instrs_to_pop:]
+            else:
+                instrs = self.look_forward(*opcodes)
+                i.num_instrs_till_end = len(instrs)
+
+            return instrs
+
+        return self.look_forward(*opcodes)
 
     def look_forward(self, *opcodes) -> typing.List[Instruction]:
         """
@@ -1222,20 +1238,20 @@ class ModuleInstance(Eventful):
         :return: The list of instructions popped before encountering the target instruction.
         """
         out = []
-        i = self._instruction_queue.popleft()
+        i = self._instruction_stack.pop()
         while i.opcode not in opcodes:
             out.append(i)
 
             # Call recursively if we encounter another block
             if i.opcode in {0x02, 0x03, 0x04}:
-                out += self.look_forward(0x0B)
+                out += self.look_forward_from_inst(i, 0x0B)
 
-            if len(self._instruction_queue) == 0:
+            if not self._instruction_stack:
                 raise RuntimeError(
                     "Couldn't find an instruction with opcode "
                     + ", ".join(hex(op) for op in opcodes)
                 )
-            i = self._instruction_queue.popleft()
+            i = self._instruction_stack.pop()
         out.append(i)
         return out
 
@@ -1263,10 +1279,10 @@ class ModuleInstance(Eventful):
         self._state = current_state
         # Use the AtomicStack context manager to catch Concretization and roll back changes
         with AtomicStack(stack) as aStack:
-            # print("Instructions:", self._instruction_queue)
-            if self._instruction_queue:
+            # print("Instructions:", self._instruction_stack)
+            if self._instruction_stack:
                 try:
-                    inst = self._instruction_queue.popleft()
+                    inst = self._instruction_stack.pop()
                     logger.debug(
                         "%s: %s (%s)",
                         hex(inst.opcode),
@@ -1293,7 +1309,7 @@ class ModuleInstance(Eventful):
                                 # Get return type from the immediate. Unfortunately, since mypy doesn't know the
                                 # immediate type, it doesn't like this and we have to ignore the type
                                 ret_type_map[inst.imm.sig],  # type: ignore
-                                self.look_forward(0x0B),  # Get the contents of this block
+                                self.look_forward_from_inst(inst, 0x0B),  # Get the contents of this block
                             )
                         elif inst.opcode == 0x03:
                             self.loop(store, aStack, inst)
@@ -1329,8 +1345,8 @@ class ModuleInstance(Eventful):
                     self._publish("did_execute_instruction", inst)
                     return True
                 except Concretize as exc:
-                    # Push the last instruction back to the queue so it will be reattempted after concretization
-                    self._instruction_queue.appendleft(inst)
+                    # Push the last instruction back to the stack so it will be reattempted after concretization
+                    self._instruction_stack.append(inst)
                     raise exc
                 except Trap as exc:
                     # Treat traps as an exit from the current call frame. This is something of a kludge to make
@@ -1411,7 +1427,7 @@ class ModuleInstance(Eventful):
         :param loop_inst: The current insrtuction
         """
         # Grab the instructions that make up the loop
-        insts = self.look_forward(0x0B)
+        insts = self.look_forward_from_inst(loop_inst, 0x0B)
         # Create a label with the full loop
         label = Label(0, [loop_inst] + insts)
         # Enter the rest of the block
