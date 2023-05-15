@@ -1216,7 +1216,6 @@ class ModuleInstance(Eventful):
         if 0x02 <= i.opcode <= 0x04 and opcodes == (0x0B,):  # Looking for the next `end` from a ctrl-flow inst.
             if (num_instrs_to_pop := i.num_instrs_till_end) is not None:
                 # We have precomputed how many instructions to pop.
-                total = len(self._instruction_stack)
                 instrs = self._instruction_stack[:-(num_instrs_to_pop + 1):-1]  # Last `num_instr_to_pop` insts, reversed.
                 assert len(instrs) == num_instrs_to_pop  # Make sure exactly `num_instrs_to_pop` instrs came out.
                 del self._instruction_stack[-num_instrs_to_pop:]
