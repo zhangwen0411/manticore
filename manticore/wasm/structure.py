@@ -1,4 +1,5 @@
 # from __future__ import annotations
+from contextlib import contextmanager
 import time
 import typing
 import types
@@ -26,6 +27,7 @@ from .types import (
     I32,
     I64,
     Instruction,
+    IP,
     LimitType,
     MemIdx,
     MemoryType,
@@ -48,7 +50,7 @@ from .types import (
 )
 from .state import State
 from ..core.smtlib import BitVec, Bool, issymbolic, Operators, Expression
-from ..core.state import Concretize
+from ..core.state import Concretize, TerminateState
 from ..utils.event import Eventful
 from ..utils import config
 
@@ -738,6 +740,25 @@ def _eval_maybe_symbolic(state, expression) -> bool:
     return True if expression else False
 
 
+@dataclass
+class InstructionStream:
+    instructions: typing.List[Instruction]
+    ip: IP  # index of the current instruction
+
+    def __getitem__(self, idx: IP) -> Instruction:
+        assert idx >= 0
+        return self.instructions[idx]
+
+    def advance(self) -> Instruction:
+        instr = self.instructions[self.ip]
+        self.ip += 1
+        return instr
+
+    def go_back_one(self) -> None:
+        self.ip -= 1
+        assert self.ip >= 0
+
+
 class ModuleInstance(Eventful):
     """
     Runtime instance of a module. Stores function types, list of addresses within the store, and exports. In this
@@ -757,7 +778,7 @@ class ModuleInstance(Eventful):
         "executor",
         "function_names",
         "local_names",
-        "_instruction_stack",
+        "_instruction_streams",
         "_block_depths",
         "_advice",
         "_state",
@@ -785,9 +806,9 @@ class ModuleInstance(Eventful):
     function_names: typing.Dict[FuncAddr, str]
     #: Stores names of local variables, if available
     local_names: typing.Dict[FuncAddr, typing.Dict[int, str]]
-    #: Stores the unpacked sequence of instructions in the reverse order they should be executed
-    # (i.e., next instruction is at the top of the stack, end of the list).
-    _instruction_stack: typing.List[Instruction]
+    #: Stores the unpacked sequence of instructions currently being executed, one sequence per frame (current frame
+    # occurring last).
+    _instruction_streams: typing.List[InstructionStream]
     #: Keeps track of the current call depth, both for functions and for code blocks. Each function call is represented
     # by appending another 0 to the list, and each code block is represented by incrementing the digit at the end of the
     # list. This is necessary because we unroll the WASM S-Expressions (nested execution trees) into a single
@@ -799,7 +820,7 @@ class ModuleInstance(Eventful):
     #: Prevents the user from invoking functions before instantiation
     instantiated: bool
     #: Stickies the current state before each instruction
-    _state: State
+    _state: typing.Optional[State]
 
     def __init__(self, constraints=None):
         self.types = []
@@ -812,7 +833,7 @@ class ModuleInstance(Eventful):
         self.executor = Executor()
         self.function_names = {}
         self.local_names = {}
-        self._instruction_stack = []
+        self._instruction_streams = [InstructionStream([], IP(0))]
         self._block_depths = [0]
         self._advice = None
         self._state = None
@@ -833,7 +854,7 @@ class ModuleInstance(Eventful):
                 "executor": self.executor,
                 "function_names": self.function_names,
                 "local_names": self.local_names,
-                "_instruction_stack": self._instruction_stack,
+                "_instruction_streams": self._instruction_streams,
                 "_block_depths": self._block_depths,
             }
         )
@@ -850,7 +871,7 @@ class ModuleInstance(Eventful):
         self.executor = state["executor"]
         self.function_names = state["function_names"]
         self.local_names = state["local_names"]
-        self._instruction_stack = state["_instruction_stack"]
+        self._instruction_streams = state["_instruction_streams"]
         self._block_depths = state["_block_depths"]
         self._advice = None
         self._state = None
@@ -860,7 +881,7 @@ class ModuleInstance(Eventful):
         """
         Empties the instruction queue and clears the block depths
         """
-        self._instruction_stack.clear()
+        self._instruction_streams.clear()
         self._block_depths = [0]
 
     def instantiate(
@@ -1118,7 +1139,16 @@ class ModuleInstance(Eventful):
                 )  # When we pop this frame, we expect to be expected_block_depth call frames deep
             )
             self._block_depths.append(0)  # We're entering a new function call context
-            self.block(store, stack, ty.result_types, f.code.body)
+            self._instruction_streams.append(InstructionStream(f.code.body, IP(0)))
+            self.block(stack, ty.result_types)
+
+    @contextmanager
+    def _instruction_stream_scope(self, instrs: WASMExpression):
+        try:
+            self._instruction_streams.append(InstructionStream(instrs, IP(0)))
+            yield
+        finally:
+            self._instruction_streams.pop()
 
     def exec_expression(self, store: Store, stack: "Stack", expr: WASMExpression):
         """
@@ -1129,14 +1159,14 @@ class ModuleInstance(Eventful):
         :param expr: The expression to execute
         :return: The result of the expression
         """
-        self.push_instructions(expr)
-        self._publish("will_exec_expression", expr)
-        while self.exec_instruction(store, stack):
-            pass
-        self._publish("did_exec_expression", expr, stack.peek())
-        return stack.pop()
+        with self._instruction_stream_scope(expr):
+            self._publish("will_exec_expression", expr)
+            while self.exec_instruction(store, stack):
+                pass
+            self._publish("did_exec_expression", expr, stack.peek())
+            return stack.pop()
 
-    def enter_block(self, insts, label: "Label", stack: "Stack"):
+    def enter_block(self, label: "Label", stack: "Stack"):
         """
         Push the instructions for the next block to the queue and bump the block depth number
 
@@ -1148,7 +1178,6 @@ class ModuleInstance(Eventful):
         """
         stack.push(label)
         self._block_depths[-1] += 1
-        self.push_instructions(insts)
 
     def exit_block(self, stack: "Stack"):
         """
@@ -1201,58 +1230,77 @@ class ModuleInstance(Eventful):
             self._block_depths.pop()
             stack.pop()
 
+            self._instruction_streams.pop()
+
             # Replace return values
             for v in vals[::-1]:
                 stack.push(v)
 
-    def push_instructions(self, insts: WASMExpression):
-        """
-        Pushes instructions into the instruction queue.
-        :param insts: Instructions to push
-        """
-        self._instruction_stack.extend(reversed(insts))
+    def look_forward_from_inst(self, i: Instruction, *opcodes, start_ip: IP = None) -> IP:
+        stream = self._instruction_streams[-1]
+        if start_ip is None:
+            start_ip = stream.ip
+        assert stream[IP(start_ip - 1)] is i
 
-    def look_forward_from_inst(self, i: Instruction, *opcodes) -> typing.List[Instruction]:
         if 0x02 <= i.opcode <= 0x04 and opcodes == (0x0B,):  # Looking for the next `end` from a ctrl-flow inst.
-            if (num_instrs_to_pop := i.num_instrs_till_end) is not None:
-                # We have precomputed how many instructions to pop.
-                instrs = self._instruction_stack[:-(num_instrs_to_pop + 1):-1]  # Last `num_instr_to_pop` insts, reversed.
-                assert len(instrs) == num_instrs_to_pop  # Make sure exactly `num_instrs_to_pop` instrs came out.
-                del self._instruction_stack[-num_instrs_to_pop:]
-            else:
-                instrs = self.look_forward(*opcodes)
-                i.num_instrs_till_end = len(instrs)
+            if i.end_ip is not None:
+                return i.end_ip  # Cached!
 
-            return instrs
+            end_ip = self.look_forward(*opcodes, start_ip=start_ip)
+            i.end_ip = end_ip
+            return end_ip
 
-        return self.look_forward(*opcodes)
+        return self.look_forward(*opcodes, start_ip=start_ip)
 
-    def look_forward(self, *opcodes) -> typing.List[Instruction]:
+    def look_forward(self, *opcodes, start_ip: IP = None) -> IP:
         """
-        Pops contents of the instruction queue until it finds an instruction with an opcode in the argument *opcodes.
+        Iterates through instruction stream until it finds an instruction with an opcode in the argument *opcodes.
         Used to find the end of a code block in the flat instruction queue. For this reason, it calls itself
         recursively (looking for the `end` instruction) if it encounters a `block`, `loop`, or `if` instruction.
 
         :param opcodes: Tuple of instruction opcodes to look for
-        :return: The list of instructions popped before encountering the target instruction.
+        :return: Location of the target instruction.
         """
-        out = []
-        i = self._instruction_stack.pop()
-        while i.opcode not in opcodes:
-            out.append(i)
+        stream = self._instruction_streams[-1]
+        if start_ip is None:
+            start_ip = stream.ip
 
+        ip = start_ip
+        while (i := stream[ip]).opcode not in opcodes:
             # Call recursively if we encounter another block
             if i.opcode in {0x02, 0x03, 0x04}:
-                out += self.look_forward_from_inst(i, 0x0B)
+                ip = self.look_forward_from_inst(i, 0x0B, start_ip=IP(ip+1))
 
-            if not self._instruction_stack:
+            ip += 1
+            if ip >= len(stream.instructions):
                 raise RuntimeError(
                     "Couldn't find an instruction with opcode "
                     + ", ".join(hex(op) for op in opcodes)
                 )
-            i = self._instruction_stack.pop()
-        out.append(i)
-        return out
+        return ip
+
+    def _curr_stream(self) -> InstructionStream:
+        return self._instruction_streams[-1]
+
+    def _is_eip_at_end(self) -> bool:
+        ip = self._get_ip()
+        eip_end = len(self._curr_stream().instructions)
+        assert 0 <= ip <= eip_end
+        return ip == eip_end
+
+    def _advance_instr(self) -> Instruction:
+        return self._curr_stream().advance()
+
+    def _go_back_one_instr(self) -> None:
+        self._curr_stream().go_back_one()
+
+    def _jump_to_ip(self, new_ip: IP) -> None:
+        stream = self._curr_stream()
+        assert 0 <= new_ip <= len(stream.instructions)
+        stream.ip = new_ip
+
+    def _get_ip(self) -> int:
+        return self._instruction_streams[-1].ip
 
     def exec_instruction(
         self,
@@ -1278,10 +1326,9 @@ class ModuleInstance(Eventful):
         self._state = current_state
         # Use the AtomicStack context manager to catch Concretization and roll back changes
         with AtomicStack(stack) as aStack:
-            # print("Instructions:", self._instruction_stack)
-            if self._instruction_stack:
+            if not self._is_eip_at_end():
                 try:
-                    inst = self._instruction_stack.pop()
+                    inst = self._advance_instr()
                     logger.debug(
                         "%s: %s (%s)",
                         hex(inst.opcode),
@@ -1303,18 +1350,17 @@ class ModuleInstance(Eventful):
 
                         if inst.opcode == 0x02:
                             self.block(
-                                store,
                                 aStack,
                                 # Get return type from the immediate. Unfortunately, since mypy doesn't know the
                                 # immediate type, it doesn't like this and we have to ignore the type
                                 ret_type_map[inst.imm.sig],  # type: ignore
-                                self.look_forward_from_inst(inst, 0x0B),  # Get the contents of this block
+                                inst,
                             )
                         elif inst.opcode == 0x03:
                             self.loop(store, aStack, inst)
                         elif inst.opcode == 0x04:
                             # Get the appropriate return type based on the immediate. Same issue w/ immediate types
-                            self.if_(store, aStack, ret_type_map[inst.imm.sig])  # type: ignore
+                            self.if_(store, aStack, ret_type_map[inst.imm.sig], inst)  # type: ignore
                         elif inst.opcode == 0x05:
                             self.else_(store, aStack)
                         elif inst.opcode == 0x0B:
@@ -1345,16 +1391,17 @@ class ModuleInstance(Eventful):
                     return True
                 except Concretize as exc:
                     # Push the last instruction back to the stack so it will be reattempted after concretization
-                    self._instruction_stack.append(inst)
+                    self._go_back_one_instr()
                     raise exc
                 except Trap as exc:
                     # Treat traps as an exit from the current call frame. This is something of a kludge to make
                     # the tests pass. I may need to revisit this in the future because I haven't thoroughly explored
                     # or thought about what the correct behavior is here.
-                    self._block_depths.pop()
-                    logger.info("Trap: %s", str(exc))
-                    self._publish("will_raise_trap", exc)
-                    raise exc
+                    raise NotImplementedError
+                    # self._block_depths.pop()
+                    # logger.info("Trap: %s", str(exc))
+                    # self._publish("will_raise_trap", exc)
+                    # raise exc
 
             elif aStack.find_type(Label):
                 # This used to raise a runtime error, but since we have some capacity to recover after a trap, we
@@ -1401,20 +1448,25 @@ class ModuleInstance(Eventful):
         return export.value
 
     def block(
-        self, store: "Store", stack: "Stack", ret_type: typing.List[ValType], insts: WASMExpression
+        self, stack: "Stack", ret_type: typing.List[ValType], inst: Instruction = None
     ):
         """
         Execute a block of instructions. Creates a label with an empty continuation and the proper arity, then enters
         the block of instructions with that label.
 
+        Assumes that the block's instructions have been pushed into the stream.
+
         https://www.w3.org/TR/wasm-core-1/#exec-block
 
         :param ret_type: List of expected return types for this block. Really only need the arity
-        :param insts: Instructions to execute
         """
         arity = len(ret_type)
-        label = Label(arity, [])
-        self.enter_block(insts, label, stack)
+        if inst:
+            end_ip = self.look_forward_from_inst(inst, 0x0B)
+        else:
+            end_ip = self.look_forward(0x0B)
+        label = Label(arity, IP(end_ip + 1))
+        self.enter_block(label, stack)
 
     def loop(self, store: "Store", stack: "AtomicStack", loop_inst):
         """
@@ -1425,59 +1477,12 @@ class ModuleInstance(Eventful):
 
         :param loop_inst: The current insrtuction
         """
-        # Grab the instructions that make up the loop
-        insts = self.look_forward_from_inst(loop_inst, 0x0B)
         # Create a label with the full loop
-        label = Label(0, [loop_inst] + insts)
+        label = Label(0, IP(self._get_ip() - 1))
         # Enter the rest of the block
-        self.enter_block(insts, label, stack)
+        self.enter_block(label, stack)
 
-    def extract_block(self, partial_list: typing.Deque[Instruction]) -> typing.Deque[Instruction]:
-        """
-        Recursively extracts blocks from a list of instructions, similar to self.look_forward. The primary difference
-        is that this version takes a list of instructions to operate over, instead of popping instructions from the
-        instruction queue.
-
-        :param partial_list: List of instructions to extract the block from
-        :return: The extracted block
-        """
-        out: typing.Deque[Instruction] = deque()
-        i = partial_list.popleft()
-        while i.opcode != 0x0B:
-            out.append(i)
-            if i.opcode in {0x02, 0x03, 0x04}:
-                out += self.extract_block(partial_list)
-            if len(partial_list) == 0:
-                raise RuntimeError("Couldn't find an end to this block!")
-            i = partial_list.popleft()
-        out.append(i)
-        return out
-
-    def _split_if_block(
-        self, partial_list: typing.Deque[Instruction]
-    ) -> typing.Tuple[typing.Deque[Instruction], typing.Deque[Instruction]]:
-        """
-        Splits an if block into its true and false portions. Handles nested blocks in both the true and false branches,
-        and when one branch is empty and/or the else instruction is missing.
-
-        :param partial_list: Complete if block that needs to be split
-        :return: The true block and the false block
-        """
-        t_block: typing.Deque[Instruction] = deque()
-        assert partial_list[-1].opcode == 0x0B, "This block is missing an end instruction!"
-        i = partial_list.popleft()
-        while i.opcode not in {0x05, 0x0B}:
-            t_block.append(i)
-            if i.opcode in {0x02, 0x03, 0x04}:
-                t_block += self.extract_block(partial_list)
-            if len(partial_list) == 0:
-                raise RuntimeError("Couldn't find an end to this if statement!")
-            i = partial_list.popleft()
-        t_block.append(i)
-
-        return t_block, partial_list
-
-    def if_(self, store: "Store", stack: "AtomicStack", ret_type: typing.List[type]):
+    def if_(self, store: "Store", stack: "AtomicStack", ret_type: typing.List[type], inst: Instruction):
         """
         Brackets two nested sequences of instructions. If the value on top of the stack is nonzero, enter the first
         block. If not, enter the second.
@@ -1493,21 +1498,19 @@ class ModuleInstance(Eventful):
         else:
             cond = i != 0
 
-        insn_block = self.look_forward(0x0B)  # Get the entire `if` block
-        # Split it into the true and false branches
-        t_block, f_block = self._split_if_block(deque(insn_block))
-        label = Label(len(ret_type), [])
+        end_ip = self.look_forward_from_inst(inst, 0x0B)
+        else_or_end_ip = self.look_forward_from_inst(inst, 0x05, 0x0B)  # TODO(zhangwen): cache this?
+        label = Label(len(ret_type), IP(end_ip + 1))
 
-        # Enter the true branch if the top of the stack is nonzero
         if cond:
-            self.enter_block(list(t_block), label, stack)
-        # Otherwise, take the false branch
-        else:
-            # Handle if there wasn't an `else` instruction
-            if len(f_block) == 0:
-                assert t_block[-1].opcode == 0x0B  # The true block is just an `end`
-                f_block.append(t_block[-1])
-            self.enter_block(list(f_block), label, stack)
+            pass  # If the condition holds, just keep executing.
+        else:  # Otherwise, take the false branch
+            if else_or_end_ip < end_ip:
+                self._jump_to_ip(IP(else_or_end_ip + 1))
+            else:  # There isn't an `else` instruction.
+                assert else_or_end_ip == end_ip
+                self._jump_to_ip(end_ip)  # Execute `end` immediately.
+        self.enter_block(label, stack)
 
     def else_(self, store: "Store", stack: "AtomicStack"):
         """
@@ -1553,11 +1556,7 @@ class ModuleInstance(Eventful):
         for v in vals[::-1]:
             stack.push(v)
 
-        # Purge the next label_depth blocks of instructions from the queue until we've reached the appropriate depth
-        for _ in range(label_depth + 1):
-            self.look_forward(0x0B, 0x05)
-        # Push the instructions from the label
-        self.push_instructions(label.instr)
+        self._jump_to_ip(label.continuation)
 
     def br_if(self, store: "Store", stack: "AtomicStack", imm: BranchImm):
         """
@@ -1629,13 +1628,19 @@ class ModuleInstance(Eventful):
             stack.push(r)
 
         # Ensure that we've returned to the correct block depth for the frame we just popped
+        # TODO(zhangwen): does this assertion always hold?
+        assert len(self._block_depths) == f.expected_block_depth + 1,\
+            f"{len(self._block_depths)} != {f.expected_block_depth} + 1"
         while len(self._block_depths) > f.expected_block_depth:
             # Discard the rest of the current block, then keep discarding blocks from the instruction queue
             # until we've purged the rest of this function.
             for i in range(self._block_depths[-1]):
-                self.look_forward(0x0B, 0x05)
+                self._jump_to_ip(IP(self.look_forward(0x0B, 0x05) + 1))
             # Pop the current function call from the block depth tracker
             self._block_depths.pop()
+
+        assert self._get_ip() == len(self._instruction_streams[-1].instructions)
+        self._instruction_streams.pop()
 
     def call(self, store: "Store", stack: "AtomicStack", imm: CallImm):
         """
@@ -1706,9 +1711,7 @@ class Label:
     """
 
     arity: int  #: the number of values this branch expects to read from the stack
-    instr: typing.List[
-        Instruction
-    ]  #: The sequence of instructions to execute if we branch to this label
+    continuation: IP  #: the location in the instruction stream to jump to if we branch to this label
 
 
 @dataclass
@@ -2162,7 +2165,7 @@ class WASIEnvironment:
     def _wasi_proc_exit(self, _state, result):
         assert self.exit_result is None, f"process exited already with result: {self.exit_result}"
         self.exit_result = result
-        return []
+        raise TerminateState(f"WASI exited {result}")
 
     @classmethod
     def _wasi_fd_fdstat_get(cls, state, fd, out_ptr):

@@ -324,20 +324,23 @@ ImmType = typing.Union[
 ]  #: Types of all immediates
 
 
+IP = typing.NewType("IP", int)
+
+
 class Instruction:
     """Internal instruction class that's pickle-friendly and works with the type system"""
 
-    __slots__ = ["opcode", "mnemonic", "imm", "num_instrs_till_end"]
+    __slots__ = ["opcode", "mnemonic", "imm", "end_ip"]
     opcode: int  #: Opcode, used for dispatching instructions
     mnemonic: str  #: Used for debugging
     imm: ImmType  #: A class with the immediate data for this instruction
-    num_instrs_till_end: typing.Optional[int]  #: For control-flow instructions, number of instructions till `end`
+    end_ip: typing.Optional[IP]  #: For control-flow instructions, index of corresponding `end`
 
     def __init__(self, inst: wasm.decode.Instruction, imm=None):
         self.opcode = inst.op.id
         self.mnemonic = inst.op.mnemonic
         self.imm = imm
-        self.num_instrs_till_end = None
+        self.end_ip = None
 
     def __repr__(self):
         return f"<Instruction: {self.mnemonic} ({debug(self.imm)})>"
