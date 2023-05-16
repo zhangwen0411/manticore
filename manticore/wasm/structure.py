@@ -1,5 +1,4 @@
 # from __future__ import annotations
-from contextlib import contextmanager
 import time
 import typing
 import types
@@ -749,14 +748,10 @@ class InstructionStream:
         assert idx >= 0
         return self.instructions[idx]
 
-    def advance(self) -> Instruction:
-        instr = self.instructions[self.ip]
-        self.ip += 1
-        return instr
-
-    def go_back_one(self) -> None:
+    def go_back_one(self, inst: Instruction) -> None:
         self.ip -= 1
         assert self.ip >= 0
+        assert self[self.ip] is inst
 
 
 class ModuleInstance(Eventful):
@@ -833,7 +828,7 @@ class ModuleInstance(Eventful):
         self.executor = Executor()
         self.function_names = {}
         self.local_names = {}
-        self._instruction_streams = [InstructionStream([], IP(0))]
+        self._instruction_streams = []
         self._block_depths = [0]
         self._advice = None
         self._state = None
@@ -1139,16 +1134,8 @@ class ModuleInstance(Eventful):
                 )  # When we pop this frame, we expect to be expected_block_depth call frames deep
             )
             self._block_depths.append(0)  # We're entering a new function call context
-            self._instruction_streams.append(InstructionStream(f.code.body, IP(0)))
+            self._push_instruction_stream(f.code.body)
             self.block(stack, ty.result_types)
-
-    @contextmanager
-    def _instruction_stream_scope(self, instrs: WASMExpression):
-        try:
-            self._instruction_streams.append(InstructionStream(instrs, IP(0)))
-            yield
-        finally:
-            self._instruction_streams.pop()
 
     def exec_expression(self, store: Store, stack: "Stack", expr: WASMExpression):
         """
@@ -1159,12 +1146,12 @@ class ModuleInstance(Eventful):
         :param expr: The expression to execute
         :return: The result of the expression
         """
-        with self._instruction_stream_scope(expr):
-            self._publish("will_exec_expression", expr)
-            while self.exec_instruction(store, stack):
-                pass
-            self._publish("did_exec_expression", expr, stack.peek())
-            return stack.pop()
+        self._push_instruction_stream(expr)
+        self._publish("will_exec_expression", expr)
+        while self.exec_instruction(store, stack):
+            pass
+        self._publish("did_exec_expression", expr, stack.peek())
+        return stack.pop()
 
     def enter_block(self, label: "Label", stack: "Stack"):
         """
@@ -1230,8 +1217,6 @@ class ModuleInstance(Eventful):
             self._block_depths.pop()
             stack.pop()
 
-            self._instruction_streams.pop()
-
             # Replace return values
             for v in vals[::-1]:
                 stack.push(v)
@@ -1279,6 +1264,9 @@ class ModuleInstance(Eventful):
                 )
         return ip
 
+    def _push_instruction_stream(self, instrs: WASMExpression):
+        self._instruction_streams.append(InstructionStream(instrs, IP(0)))
+
     def _curr_stream(self) -> InstructionStream:
         return self._instruction_streams[-1]
 
@@ -1288,16 +1276,31 @@ class ModuleInstance(Eventful):
         assert 0 <= ip <= eip_end
         return ip == eip_end
 
-    def _advance_instr(self) -> Instruction:
-        return self._curr_stream().advance()
+    def _maintain_instr_streams(self) -> None:
+        while self._instruction_streams:
+            stream = self._curr_stream()
+            if stream.ip < len(stream.instructions):
+                break
 
-    def _go_back_one_instr(self) -> None:
-        self._curr_stream().go_back_one()
+            assert stream.ip == len(stream.instructions)
+            self._instruction_streams.pop()
+
+    def _advance_instr(self) -> Instruction:
+        stream = self._curr_stream()
+        i = stream[stream.ip]
+        stream.ip += 1
+        self._maintain_instr_streams()
+        return i
+
+    def _go_back_one_instr(self, inst: Instruction) -> None:
+        """Moves instruction pointer back by one place; asserts that current instruction is now `inst`."""
+        self._curr_stream().go_back_one(inst)
 
     def _jump_to_ip(self, new_ip: IP) -> None:
         stream = self._curr_stream()
         assert 0 <= new_ip <= len(stream.instructions)
         stream.ip = new_ip
+        self._maintain_instr_streams()
 
     def _get_ip(self) -> int:
         return self._instruction_streams[-1].ip
@@ -1326,7 +1329,7 @@ class ModuleInstance(Eventful):
         self._state = current_state
         # Use the AtomicStack context manager to catch Concretization and roll back changes
         with AtomicStack(stack) as aStack:
-            if not self._is_eip_at_end():
+            if self._instruction_streams:
                 try:
                     inst = self._advance_instr()
                     logger.debug(
@@ -1391,7 +1394,7 @@ class ModuleInstance(Eventful):
                     return True
                 except Concretize as exc:
                     # Push the last instruction back to the stack so it will be reattempted after concretization
-                    self._go_back_one_instr()
+                    self._go_back_one_instr(inst)
                     raise exc
                 except Trap as exc:
                     # Treat traps as an exit from the current call frame. This is something of a kludge to make
@@ -1639,9 +1642,6 @@ class ModuleInstance(Eventful):
             # Pop the current function call from the block depth tracker
             self._block_depths.pop()
 
-        assert self._get_ip() == len(self._instruction_streams[-1].instructions)
-        self._instruction_streams.pop()
-
     def call(self, store: "Store", stack: "AtomicStack", imm: CallImm):
         """
         Invoke the function at the address in the store given by the immediate.
@@ -1755,6 +1755,7 @@ class Stack(Eventful):
     """
 
     data: typing.Deque[StackItem]  #: Underlying datastore for the "stack"
+    frames: typing.List[Activation]  #: Activations on the stack, for easy access
 
     _published_events = {"push_item", "pop_item"}
 
@@ -1763,7 +1764,16 @@ class Stack(Eventful):
         :param init_data: Optional initialization value
         """
         self.data = init_data if init_data else deque()
+        self.frames = self._compute_frames(self.data)
         super().__init__()
+
+    @staticmethod
+    def _compute_frames(data: typing.Deque[StackItem]) -> typing.List[Activation]:
+        frames = []
+        for item in data:
+            if isinstance(item, Activation):
+                frames.append(item)
+        return frames
 
     def __getstate__(self):
         state = super().__getstate__()
@@ -1772,6 +1782,7 @@ class Stack(Eventful):
 
     def __setstate__(self, state):
         self.data = state["data"]
+        self.frames = self._compute_frames(self.data)
         super().__setstate__(state)
 
     def push(self, val: StackItem) -> None:
@@ -1786,6 +1797,8 @@ class Stack(Eventful):
         logger.debug("+%d %s (%s)", len(self.data), val, type(val))
         self._publish("will_push_item", val, len(self.data))
         self.data.append(val)
+        if isinstance(val, Activation):
+            self.frames.append(val)
         self._publish("did_push_item", val, len(self.data))
 
     def pop(self) -> StackItem:
@@ -1797,6 +1810,9 @@ class Stack(Eventful):
         logger.debug("-%d %s (%s)", len(self.data) - 1, self.peek(), type(self.peek()))
         self._publish("will_pop_item", len(self.data))
         item = self.data.pop()
+        if isinstance(item, Activation):
+            frame = self.frames.pop()
+            assert item is frame
         self._publish("did_pop_item", item, len(self.data))
         return item
 
@@ -1870,10 +1886,7 @@ class Stack(Eventful):
         """
         :return: the topmost frame (Activation) on the stack
         """
-        for item in reversed(self.data):
-            if isinstance(item, Activation):
-                return item
-        raise RuntimeError("Couldn't find a frame on the stack")
+        return self.frames[-1]
 
 
 class AtomicStack(Stack):  # lgtm [py/missing-call-to-init]
