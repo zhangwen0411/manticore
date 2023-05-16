@@ -1166,7 +1166,7 @@ class ModuleInstance(Eventful):
         stack.push(label)
         self._block_depths[-1] += 1
 
-    def exit_block(self, stack: "Stack"):
+    def exit_block(self, stack: "Stack") -> typing.Optional["Label"]:
         """
         Cleans up after execution of a code block.
 
@@ -1190,6 +1190,9 @@ class ModuleInstance(Eventful):
             # Put the values back on the stack and discard the label
             for v in vals[::-1]:
                 stack.push(v)
+            return label
+
+        return None
 
     def exit_function(self, stack: "AtomicStack"):
         """
@@ -1521,7 +1524,9 @@ class ModuleInstance(Eventful):
         Typically, `if` blocks look like: `if <instructions> else <instructions> end`. That's not always the case. See:
         https://webassembly.github.io/spec/core/text/instructions.html#abbreviations
         """
-        self.exit_block(stack)
+        label = self.exit_block(stack)
+        assert label is not None
+        self._jump_to_ip(label.continuation)
 
     def end(self, store: "Store", stack: "AtomicStack"):
         """
